@@ -547,20 +547,20 @@ def generate_response(prompt: str, user_input: str, greeting: str, use_greeting:
     return f"{greeting}, sounds cool! What's up?" if use_greeting else "Sounds cool! What's up?"
 
 
-def clear_and_repopulate():
-    logger.info("Clearing and repopulating database")
-    clear_database()
-    embedding_cache.clear()
-    populate_users()
-    populate_conversations()
-    populate_journals()
-    verify_data()
+#def clear_and_repopulate():
+#    logger.info("Clearing and repopulating database")
+#    clear_database()
+#    embedding_cache.clear()
+#    populate_users()
+#    populate_conversations()
+#    populate_journals()
+#    verify_data()
     # Verify embeddings before initializing FAISS
-    embeddings_count = embeddings_collection.count_documents({})
-    if embeddings_count == 0:
-        logger.info("No embeddings found, initializing empty FAISS store")
-        faiss_store = FAISS.from_texts(["empty"], embeddings)
-        return
+#    embeddings_count = embeddings_collection.count_documents({})
+#    if embeddings_count == 0:
+#        logger.info("No embeddings found, initializing empty FAISS store")
+#        faiss_store = FAISS.from_texts(["empty"], embeddings)
+#        return
 
 
 
