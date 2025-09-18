@@ -538,59 +538,179 @@ async def should_include_memories(user_input: str, speaker_id: str, user_id: str
                 relevant_memories.append(m)
     return bool(relevant_memories), relevant_memories[:3]
 
-async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_input: str) -> tuple:
-    logger.info(f"Initializing bot: speaker={speaker_id}, target={target_id}, bot_role={bot_role}")
-    await get_mongo_client()
-    speaker = await users_collection.find_one({"user_id": speaker_id})
-    target = await users_collection.find_one({"user_id": target_id})
-    if not speaker or not target:
-        raise ValueError("Invalid speaker or target ID")
+# async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_input: str) -> tuple:
+#     logger.info(f"Initializing bot: speaker={speaker_id}, target={target_id}, bot_role={bot_role}")
+#     await get_mongo_client()
+#     speaker = await users_collection.find_one({"user_id": speaker_id})
+#     target = await users_collection.find_one({"user_id": target_id})
+#     if not speaker or not target:
+#         raise ValueError("Invalid speaker or target ID")
 
+#     traits = await generate_personality_traits(target_id)
+#     recent_history = await get_recent_conversation_history(speaker_id, target_id)
+#     history_text = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in recent_history]) or "No recent conversation history."
+#     use_greeting = not recent_history or (datetime.utcnow() - recent_history[-1]["raw_timestamp"]).total_seconds() / 60 > 30
+#     greeting, tone = await get_greeting_and_tone(bot_role, target_id)
+
+#     include_memories, memories = await should_include_memories(user_input, speaker_id, target_id)
+#     memories_text = "No relevant memories."
+#     if include_memories and memories:
+#         valid_memories = [m for m in memories if all(key in m for key in ["content", "type", "timestamp", "speaker_name"])]
+#         if valid_memories:
+#             memories_text = "\n".join([
+#                 f"- {m['content']} ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')}, said by {m['speaker_name']})"
+#                 for m in valid_memories
+#             ])
+
+#     if include_memories:
+#         prompt = f"""
+#         You are {target['name']}, responding as an AI Twin to {speaker['name']}, you are his/her {bot_role}.
+#         Generate a short 2-3 sentence reply that:
+#         - Uses a {tone} tone, appropriate for your relationship with {speaker['name']}.
+#         - Reflects your personality: {', '.join([f"{k} ({v['explanation']})" for k, v in list(traits['core_traits'].items())[:3]])}.
+#         - Uses this recent context:
+#         {history_text}
+#         - If relevant to '{user_input}', weave in one or two of these memories naturally, clearly attributing them to their speaker:
+#         {memories_text}
+#         - Prioritize recent and highly relevant memories; stick to these details strictly and do not invent details.
+#         - {'Starts with "' + greeting + '" if no recent messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
+#         - Keeps responses short, casual, and personalized.
+#         Input: {user_input}
+#         """
+#     else:
+#         prompt = f"""
+#         You are {target['name']}, responding as an AI Twin to {speaker['name']}, his/her {bot_role}.
+#         Generate a short 2-3 sentence reply that:
+#         - Uses a {tone} tone, appropriate for your relationship with {speaker['name']}.
+#         - Reflects your personality: {', '.join([f"{k} ({v['explanation']})" for k, v in list(traits['core_traits'].items())[:3]])}.
+#         - Uses this recent conversation history for context:
+#         {history_text}
+#         - Focuses on the current input without referencing past memories unless explicitly relevant; stick to these details strictly and do not invent details.
+#         - {'Starts with "' + greeting + '" if no recent messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
+#         - Keeps responses short, casual, and personalized.
+#         Input: {user_input}
+#         """
+#     return prompt, greeting, use_greeting
+
+
+async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_input: str) -> Tuple[str,str,bool]:
+    """
+    Build a prompt that:
+    - keeps timestamps in context,
+    - does NOT let the model treat the *current* message as a past event,
+    - only allows "you asked this before..." if there's a real earlier duplicate,
+    - explicitly reassures the model to respond to the Current user input.
+    """
+    sp = await users_col.find_one({"user_id": speaker_id})
+    tg = await users_col.find_one({"user_id": target_id})
+    if not sp or not tg:
+        raise ValueError("Invalid IDs")
+
+    # Get traits
     traits = await generate_personality_traits(target_id)
-    recent_history = await get_recent_conversation_history(speaker_id, target_id)
-    history_text = "\n".join([f"{msg['speaker']}: {msg['content']}" for msg in recent_history]) or "No recent conversation history."
-    use_greeting = not recent_history or (datetime.utcnow() - recent_history[-1]["raw_timestamp"]).total_seconds() / 60 > 30
-    greeting, tone = await get_greeting_and_tone(bot_role, target_id)
 
-    include_memories, memories = await should_include_memories(user_input, speaker_id, target_id)
-    memories_text = "No relevant memories."
-    if include_memories and memories:
-        valid_memories = [m for m in memories if all(key in m for key in ["content", "type", "timestamp", "speaker_name"])]
-        if valid_memories:
-            memories_text = "\n".join([
-                f"- {m['content']} ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')}, said by {m['speaker_name']})"
-                for m in valid_memories
+    # Pull recent messages (sorted ascending by timestamp at the end of get_recent_conversation_history)
+    recent = await get_recent_conversation_history(speaker_id, target_id)
+
+    # Exclude the immediate current turn from "history"
+    history_for_prompt = recent[:]
+    if recent:
+        last = recent[-1]
+        # If last content equals the current input, drop it from history
+        if last.get("content", "").strip() == user_input.strip():
+            history_for_prompt = recent[:-1]
+
+    # Detect a real earlier duplicate (semantic sim) ONLY in prior history
+    allow_repeat_ref = False
+    try:
+        loop = asyncio.get_event_loop()
+        q_emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(user_input))
+        earlier_msgs = [m for m in history_for_prompt if m.get("content")]
+        earlier_tail = earlier_msgs[-10:]
+        for m in earlier_tail:
+            emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(m["content"]))
+            sim = float(np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb)))
+            if sim >= 0.92:  # high bar to avoid false claims
+                allow_repeat_ref = True
+                break
+    except Exception:
+        allow_repeat_ref = False
+
+    # Build readable history WITH timestamps (excluding the current message)
+    if history_for_prompt:
+        hist_text = "\n".join([
+            f"[{m['raw_timestamp'].strftime('%Y-%m-%d %H:%M:%S')}] {m['content']}"
+            for m in history_for_prompt
+        ])
+        last_ts = history_for_prompt[-1]["raw_timestamp"]
+    else:
+        hist_text = "No earlier messages."
+        last_ts = None
+
+    # Greeting logic based on prior history
+    use_greeting = (not history_for_prompt) or (datetime.now(pytz.UTC) - as_utc_aware(last_ts)).total_seconds()/60 > 30
+    greeting, tone = await get_greeting_and_tone("friend" if not bot_role else bot_role, target_id)
+
+    # Memories (keep timestamps)
+    include, mems = await should_include_memories(user_input, speaker_id, target_id)
+    mems_text = "No relevant memories."
+    if include and mems:
+        good = [m for m in mems if all(k in m for k in ["content","type","timestamp","speaker_name"])]
+        if good:
+            mems_text = "\n".join([
+                f"- [{m['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}] {m['content']} ({m['type']}, said by {m['speaker_name']})"
+                for m in good
             ])
 
-    if include_memories:
+    rails = f"""
+    Grounding rules:
+    - You may reference dates/timestamps found in the earlier conversation history.
+    - Do NOT refer to the current message as if it were a past event.
+    - Only say things like "you asked this before" or "as you asked on <date>" if there is a clearly earlier message that is highly similar to the user's current message. This permission is: {"ALLOWED" if allow_repeat_ref else "NOT ALLOWED"}.
+    - If not allowed, avoid implying repetition; respond normally without claiming prior duplication.
+    """
+
+    trait_str = ', '.join([f"{k} ({v['explanation']})" for k,v in list(traits.get('core_traits', {}).items())[:3]]) or "balanced"
+
+    if include:
         prompt = f"""
-        You are {target['name']}, responding as an AI Twin to {speaker['name']}, you are his/her {bot_role}.
-        Generate a short 2-3 sentence reply that:
-        - Uses a {tone} tone, appropriate for your relationship with {speaker['name']}.
-        - Reflects your personality: {', '.join([f"{k} ({v['explanation']})" for k, v in list(traits['core_traits'].items())[:3]])}.
-        - Uses this recent context:
-        {history_text}
-        - If relevant to '{user_input}', weave in one or two of these memories naturally, clearly attributing them to their speaker:
-        {memories_text}
-        - Prioritize recent and highly relevant memories; stick to these details strictly and do not invent details.
-        - {'Starts with "' + greeting + '" if no recent messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
-        - Keeps responses short, casual, and personalized.
-        Input: {user_input}
+        You are {tg.get('display_name', tg.get('username'))}, responding as an AI Twin to {sp.get('display_name', sp.get('username'))}, their {bot_role}.
+        Use a {tone} tone and reflect your personality: {trait_str}.
+
+        Earlier conversation (timestamps included, excludes the current message):
+        {hist_text}
+
+        Potentially relevant memories:
+        {mems_text}
+
+        {rails}
+
+        - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
+        - Keep it short (2–3 sentences), natural, and personalized.
+        Current user input: {user_input}
+
+        Respond directly to the Current user input above.
         """
     else:
         prompt = f"""
-        You are {target['name']}, responding as an AI Twin to {speaker['name']}, his/her {bot_role}.
-        Generate a short 2-3 sentence reply that:
-        - Uses a {tone} tone, appropriate for your relationship with {speaker['name']}.
-        - Reflects your personality: {', '.join([f"{k} ({v['explanation']})" for k, v in list(traits['core_traits'].items())[:3]])}.
-        - Uses this recent conversation history for context:
-        {history_text}
-        - Focuses on the current input without referencing past memories unless explicitly relevant; stick to these details strictly and do not invent details.
-        - {'Starts with "' + greeting + '" if no recent messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
-        - Keeps responses short, casual, and personalized.
-        Input: {user_input}
+        You are {tg.get('display_name', tg.get('username'))}, responding as an AI Twin to {sp.get('display_name', sp.get('username'))}, their {bot_role}.
+        Use a {tone} tone and reflect your personality: {trait_str}.
+
+        Earlier conversation (timestamps included, excludes the current message):
+        {hist_text}
+
+        {rails}
+
+        - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
+        - Keep it short (2–3 sentences), natural, and personalized.
+        Current user input: {user_input}
+
+        Respond directly to the Current user input above.
         """
+
     return prompt, greeting, use_greeting
+
+
 
 async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool) -> str:
     logger.info(f"Generating response for input='{user_input[:50]}...'")
@@ -857,4 +977,5 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     start_change_stream_watcher()
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
